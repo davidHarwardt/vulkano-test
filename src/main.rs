@@ -21,7 +21,7 @@ use vulkano::{
     buffer::{
         Buffer,
         BufferCreateInfo,
-        BufferUsage,
+        BufferUsage, BufferContents,
     },
     command_buffer::{
         allocator::{
@@ -32,7 +32,7 @@ use vulkano::{
         CommandBufferUsage, 
         CopyBufferInfo, 
         ClearColorImageInfo, 
-        CopyImageToBufferInfo,
+        CopyImageToBufferInfo, RenderPassBeginInfo, SubpassContents,
     }, 
     sync::{
         self, 
@@ -41,7 +41,7 @@ use vulkano::{
     pipeline::{
         ComputePipeline, 
         Pipeline, 
-        PipelineBindPoint,
+        PipelineBindPoint, graphics::{vertex_input::Vertex, viewport::{Viewport, ViewportState}, input_assembly::InputAssemblyState}, GraphicsPipeline,
     }, 
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, 
@@ -55,7 +55,7 @@ use vulkano::{
     format::{
         Format, 
         ClearColorValue,
-    },
+    }, render_pass::{Framebuffer, FramebufferCreateInfo, Subpass},
 };
     
 mod cs {
@@ -88,6 +88,43 @@ mod cs {
             }
         ",
     }
+}
+
+mod vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        src: r"
+            #version 460
+
+            layout(location = 0) in vec2 pos;
+
+            void main() {
+                gl_Position = vec4(pos, 0.0, 1.0);
+            }
+        ",
+    }
+}
+
+mod fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        src: r"
+            #version 460
+
+            layout(location = 0) out vec4 f_color;
+
+            void main() {
+                f_color = vec4(1.0, 0.0, 0.0, 1.0);
+            }
+        ",
+    }
+}
+
+#[derive(BufferContents, Vertex)]
+#[repr(C)]
+struct Vert {
+    #[format(R32G32_SFLOAT)]
+    pos: [f32; 2],
 }
 
 fn main() {
@@ -125,20 +162,22 @@ fn main() {
 
     let alloc = StandardMemoryAllocator::new_default(dev.clone());
 
-    let img = StorageImage::new(
-        &alloc,
-        ImageDimensions::Dim2d {
-            width: 1024,
-            height: 1024,
-            array_layers: 1,
-        },
-        Format::R8G8B8A8_UNORM,
-        Some(queue.queue_family_index()),
-    ).expect("could not create image");
+    let verts = vec![
+        Vert { pos: [-0.5, -0.5] },
+        Vert { pos: [ 0.0,  0.5] },
+        Vert { pos: [ 0.5, -0.25] },
+    ];
 
-    let img_view = ImageView::new_default(img.clone()).expect("could not create image view");
+    let vs = vs::load(dev.clone()).expect("failed to create vertex shader");
+    let fs = fs::load(dev.clone()).expect("failed to create fragment shader");
 
-    let img_buf = Buffer::from_iter(
+    let viewport = Viewport {
+        origin: [0.0, 0.0],
+        dimensions: [1024.0, 1024.0],
+        depth_range: 0.0..1.0,
+    };
+
+    let img_buffer = Buffer::from_iter(
         &alloc,
         BufferCreateInfo {
             usage: BufferUsage::TRANSFER_DST,
@@ -148,78 +187,101 @@ fn main() {
             usage: MemoryUsage::Download,
             ..Default::default()
         },
-        (0..(1024 * 1024 * 4)).map(|_| 0u8),
-    ).expect("could not create img_buf");
+        (0..(1024 * 1024 * 4)).map(|_| 0u8)
+    ).expect("failed to create img buffer");
 
-    let shader = cs::load(dev.clone())
-        .expect("failed to create shader module");
+    let vert_buffer = Buffer::from_iter(
+        &alloc,
+        BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            usage: MemoryUsage::Upload,
+            ..Default::default()
+        },
+        verts,
+    ).expect("could not create vertex buffer");
 
-    let compute_pipeline = ComputePipeline::new(
+    let pass = vulkano::single_pass_renderpass! {
         dev.clone(),
-        shader.entry_point("main").unwrap(),
-        &(),
-        None,
-        |_| {},
-    ).expect("could not create compute pipeline");
+        attachments: {
+            color: {
+                load: Clear,
+                store: Store,
+                format: Format::R8G8B8A8_UNORM,
+                samples: 1,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {},
+        },
+    }.expect("could not create render_pass");
 
-    let desc_set_alloc = StandardDescriptorSetAllocator::new(dev.clone());
-    let pipeline_layout = compute_pipeline.layout();
-    let desc_set_layouts = pipeline_layout.set_layouts();
+    let pipeline = GraphicsPipeline::start()
+        .vertex_input_state(Vert::per_vertex())
+        .vertex_shader(vs.entry_point("main").unwrap(), ())
+        .fragment_shader(fs.entry_point("main").unwrap(), ())
+        .input_assembly_state(InputAssemblyState::new())
+        .viewport_state(ViewportState::viewport_fixed_scissor_irrelevant([viewport]))
+        .render_pass(Subpass::from(pass.clone(), 0).unwrap())
+    .build(dev.clone()).expect("could not build graphics pipeline");
 
-    let desc_set_layout_idx = 0;
-    let desc_set_layout = desc_set_layouts
-        .get(desc_set_layout_idx)
-    .unwrap();
-    let desc_set = PersistentDescriptorSet::new(
-        &desc_set_alloc,
-        desc_set_layout.clone(),
-        [WriteDescriptorSet::image_view(0, img_view.clone())],
-    ).expect("could not create desc_set");
+    let img = StorageImage::new(
+        &alloc,
+        ImageDimensions::Dim2d { width: 1024, height: 1024, array_layers: 1 },
+        Format::R8G8B8A8_UNORM,
+        Some(queue.queue_family_index()),
+    ).expect("could not create img");
+    let view = ImageView::new_default(img.clone()).expect("could not create image view");
+
+    let framebuffer = Framebuffer::new(
+        pass.clone(),
+        FramebufferCreateInfo {
+            attachments: vec![view],
+            ..Default::default()
+        },
+    ).expect("could not create framebuffer");
 
     let cmd_buf_alloc = StandardCommandBufferAllocator::new(
         dev.clone(),
-        StandardCommandBufferAllocatorCreateInfo::default(),
+        StandardCommandBufferAllocatorCreateInfo::default()
     );
-
-    let mut cmd_buf_builder = AutoCommandBufferBuilder::primary(
+    let mut cmd_builder = AutoCommandBufferBuilder::primary(
         &cmd_buf_alloc,
         queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
-    ).expect("could not create cmd_buf_builder");
+    ).expect("could not create cmd_builder");
 
-    let wg_count = [1024, 1, 1];
+    cmd_builder
+        .begin_render_pass(RenderPassBeginInfo {
+            clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
+            ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
+        }, SubpassContents::Inline)
+        .expect("could not begin renderpass")
+        .bind_pipeline_graphics(pipeline.clone())
+        .bind_vertex_buffers(0, vert_buffer.clone())
+        .draw(3, 1, 0, 0)
+        .expect("could not draw")
+        .end_render_pass()
+        .expect("could not end renderpass")
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(img, img_buffer.clone()))
+    .expect("could not copy framebuffer to img_buffer");
 
-    cmd_buf_builder
-        .bind_pipeline_compute(compute_pipeline.clone())
-        .bind_descriptor_sets(
-            PipelineBindPoint::Compute,
-            compute_pipeline.layout().clone(),
-            0,
-            desc_set,
-        )
-        .dispatch([1024 / 8, 1024 / 8, 1]).expect("compute pass failed")
-        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
-            img.clone(),
-            img_buf.clone(),
-        ))
-    .expect("cmd_buf failed to build");
-
-    let cmd_buf = cmd_buf_builder
-        .build()
-    .expect("could not build command buffer");
-
+    let cmd_buf = cmd_builder.build().expect("could not build command buffer");
     let fut = sync::now(dev.clone())
         .then_execute(queue.clone(), cmd_buf)
-        .expect("coult not execute cmd_buf")
+        .expect("could not execute cmd_buf")
         .then_signal_fence_and_flush()
-    .expect("failed to flush");
-    fut.wait(None).expect("waiting for fut failed");
+    .expect("could not flush");
+    fut.wait(None).unwrap();
 
-    let buf_contents = img_buf.read().expect("could not read img_buf");
-    let cpu_img = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buf_contents[..])
-        .expect("could not create cpu_img");
+    let buf_img = img_buffer.read().expect("could not read image buffer");
+    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buf_img[..])
+        .expect("could not create img from data");
 
-    cpu_img.save("img.png").expect("could not save img");
+    img.save("img.png").expect("could not save img");
 
     tracing::info!("ok");
 }
