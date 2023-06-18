@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use vulkano::{
     VulkanLibrary,
     instance::{
@@ -20,9 +22,28 @@ use vulkano::{
         BufferCreateInfo,
         BufferUsage,
     },
-    command_buffer::{allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo}, AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo}, sync::{self, GpuFuture},
+    command_buffer::{allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo}, AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo}, sync::{self, GpuFuture}, pipeline::{ComputePipeline, Pipeline, PipelineBindPoint}, descriptor_set::{allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet}, image::{StorageImage, ImageDimensions}, format::Format,
 };
     
+mod cs {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        src: r"
+            #version 460
+
+            layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+            layout(set = 0, binding = 0) buffer Data {
+                uint data[];
+            } buf;
+
+            void main() {
+                uint idx = gl_GlobalInvocationID.x;
+                buf.data[idx] *= 12;
+            }
+        ",
+    }
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -59,60 +80,97 @@ fn main() {
 
     let alloc = StandardMemoryAllocator::new_default(dev.clone());
 
-    let src = Buffer::from_iter(
+    let data_buf = Buffer::from_iter(
         &alloc,
         BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,
+            usage: BufferUsage::STORAGE_BUFFER,
             ..Default::default()
         },
         AllocationCreateInfo {
             usage: MemoryUsage::Upload,
             ..Default::default()
         },
-        0i32..64,
-    ).expect("could not create src buffer");
+        0..65536u32,
+    ).expect("could not create data_buffer");
 
-    let dest = Buffer::from_iter(
-        &alloc,
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            usage: MemoryUsage::Download,
-            ..Default::default()
-        },
-        (0..64).map(|_| 0i32),
-    ).expect("could not create dest buffer");
+    let shader = cs::load(dev.clone())
+        .expect("failed to create shader module");
+
+    let compute_pipeline = ComputePipeline::new(
+        dev.clone(),
+        shader.entry_point("main").unwrap(),
+        &(),
+        None,
+        |_| {},
+    ).expect("could not create compute pipeline");
+
+    let desc_set_alloc = StandardDescriptorSetAllocator::new(dev.clone());
+    let pipeline_layout = compute_pipeline.layout();
+    let desc_set_layouts = pipeline_layout.set_layouts();
+
+    let desc_set_layout_idx = 0;
+    let desc_set_layout = desc_set_layouts
+        .get(desc_set_layout_idx)
+    .unwrap();
+    let desc_set = PersistentDescriptorSet::new(
+        &desc_set_alloc,
+        desc_set_layout.clone(),
+        [WriteDescriptorSet::buffer(0, data_buf.clone())],
+    ).expect("could not create desc_set");
 
     let cmd_buf_alloc = StandardCommandBufferAllocator::new(
         dev.clone(),
         StandardCommandBufferAllocatorCreateInfo::default(),
     );
 
-    let mut builder = AutoCommandBufferBuilder::primary(
+    let img = StorageImage::new(
+        &alloc,
+        ImageDimensions::Dim2d {
+            width: 1024,
+            height: 1024,
+            array_layers: 1,
+        },
+        Format::R8G8B8A8_UNORM,
+        Some(queue.queue_family_index()),
+    ).expect("could not create image");
+
+    let mut cmd_buf_builder = AutoCommandBufferBuilder::primary(
         &cmd_buf_alloc,
-        queue_family_index,
+        queue.queue_family_index(),
         CommandBufferUsage::OneTimeSubmit,
-    ).expect("could not create cmb_buffer_builder");
+    ).expect("could not create cmd_buf_builder");
 
-    builder
-        .copy_buffer(CopyBufferInfo::buffers(src.clone(), dest.clone()))
-        .expect("could not write commands to buffer");
+    let wg_count = [1024, 1, 1];
 
-    let cmd_buf = builder.build().expect("could not build command buffer");
+    cmd_buf_builder
+        .bind_pipeline_compute(compute_pipeline.clone())
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            compute_pipeline.layout().clone(),
+            desc_set_layout_idx as _,
+            desc_set,
+        )
+        .dispatch(wg_count)
+    .expect("cs dispatch failed");
+
+    let cmd_buf = cmd_buf_builder
+        .build()
+    .expect("could not build command buffer");
 
     let fut = sync::now(dev.clone())
         .then_execute(queue.clone(), cmd_buf)
-        .expect("could not execute cmd_buffer")
+        .expect("coult not execute cmd_buf")
         .then_signal_fence_and_flush()
     .expect("failed to flush");
+    fut.wait(None).expect("waiting for fut failed");
 
-    fut.wait(None).expect("error waiting for future");
-
-    let src_data = src.read().unwrap();
-    let dest_data = dest.read().unwrap();
-    assert_eq!(&*src_data, &*dest_data);
+    let content = data_buf.read().expect("could not read data_buf");
+    for (n, val) in content.iter().enumerate() {
+        assert_eq!(*val, n as u32 * 12);
+    }
 
     tracing::info!("ok");
 }
+
+
+
