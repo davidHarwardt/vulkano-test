@@ -23,7 +23,39 @@ use vulkano::{
         BufferCreateInfo,
         BufferUsage,
     },
-    command_buffer::{allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo}, AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo, ClearColorImageInfo, CopyImageToBufferInfo}, sync::{self, GpuFuture}, pipeline::{ComputePipeline, Pipeline, PipelineBindPoint}, descriptor_set::{allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet}, image::{StorageImage, ImageDimensions}, format::{Format, ClearColorValue},
+    command_buffer::{
+        allocator::{
+            StandardCommandBufferAllocator,
+            StandardCommandBufferAllocatorCreateInfo
+        },
+        AutoCommandBufferBuilder,
+        CommandBufferUsage, 
+        CopyBufferInfo, 
+        ClearColorImageInfo, 
+        CopyImageToBufferInfo,
+    }, 
+    sync::{
+        self, 
+        GpuFuture,
+    }, 
+    pipeline::{
+        ComputePipeline, 
+        Pipeline, 
+        PipelineBindPoint,
+    }, 
+    descriptor_set::{
+        allocator::StandardDescriptorSetAllocator, 
+        PersistentDescriptorSet, 
+        WriteDescriptorSet,
+    }, 
+    image::{
+        StorageImage, 
+        ImageDimensions, view::ImageView,
+    }, 
+    format::{
+        Format, 
+        ClearColorValue,
+    },
 };
     
 mod cs {
@@ -32,15 +64,27 @@ mod cs {
         src: r"
             #version 460
 
-            layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+            layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-            layout(set = 0, binding = 0) buffer Data {
-                uint data[];
-            } buf;
+            layout(set = 0, binding = 0, rgba8) uniform writeonly image2D img;
 
             void main() {
-                uint idx = gl_GlobalInvocationID.x;
-                buf.data[idx] *= 12;
+                vec2 norm_coords = (gl_GlobalInvocationID.xy + vec2(0.5)) / vec2(imageSize(img));
+                vec2 c = (norm_coords - vec2(0.5)) * 2.0 - vec2(1.0, 0.0);
+
+                vec2 z = vec2(0.0, 0.0);
+                float i;
+                for(i = 0.0; i < 1.0; i += 0.005) {
+                    z = vec2(
+                        z.x * z.x - z.y * z.y + c.x,
+                        z.y * z.x + z.x * z.y + c.y
+                    );
+
+                    if(length(z) > 4.0) break;
+                }
+
+                vec4 col = vec4(vec3(i), 1.0);
+                imageStore(img, ivec2(gl_GlobalInvocationID.xy), col);
             }
         ",
     }
@@ -81,18 +125,31 @@ fn main() {
 
     let alloc = StandardMemoryAllocator::new_default(dev.clone());
 
-    let data_buf = Buffer::from_iter(
+    let img = StorageImage::new(
+        &alloc,
+        ImageDimensions::Dim2d {
+            width: 1024,
+            height: 1024,
+            array_layers: 1,
+        },
+        Format::R8G8B8A8_UNORM,
+        Some(queue.queue_family_index()),
+    ).expect("could not create image");
+
+    let img_view = ImageView::new_default(img.clone()).expect("could not create image view");
+
+    let img_buf = Buffer::from_iter(
         &alloc,
         BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
+            usage: BufferUsage::TRANSFER_DST,
             ..Default::default()
         },
         AllocationCreateInfo {
-            usage: MemoryUsage::Upload,
+            usage: MemoryUsage::Download,
             ..Default::default()
         },
-        0..65536u32,
-    ).expect("could not create data_buffer");
+        (0..(1024 * 1024 * 4)).map(|_| 0u8),
+    ).expect("could not create img_buf");
 
     let shader = cs::load(dev.clone())
         .expect("failed to create shader module");
@@ -116,37 +173,13 @@ fn main() {
     let desc_set = PersistentDescriptorSet::new(
         &desc_set_alloc,
         desc_set_layout.clone(),
-        [WriteDescriptorSet::buffer(0, data_buf.clone())],
+        [WriteDescriptorSet::image_view(0, img_view.clone())],
     ).expect("could not create desc_set");
 
     let cmd_buf_alloc = StandardCommandBufferAllocator::new(
         dev.clone(),
         StandardCommandBufferAllocatorCreateInfo::default(),
     );
-
-    let img = StorageImage::new(
-        &alloc,
-        ImageDimensions::Dim2d {
-            width: 1024,
-            height: 1024,
-            array_layers: 1,
-        },
-        Format::R8G8B8A8_UNORM,
-        Some(queue.queue_family_index()),
-    ).expect("could not create image");
-
-    let img_buf = Buffer::from_iter(
-        &alloc,
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            usage: MemoryUsage::Download,
-            ..Default::default()
-        },
-        (0..(1024 * 1024 * 4)).map(|_| 0u8),
-    ).expect("could not create img_buf");
 
     let mut cmd_buf_builder = AutoCommandBufferBuilder::primary(
         &cmd_buf_alloc,
@@ -157,10 +190,14 @@ fn main() {
     let wg_count = [1024, 1, 1];
 
     cmd_buf_builder
-        .clear_color_image(ClearColorImageInfo {
-            clear_value: ClearColorValue::Float([1.0, 1.0, 1.0, 1.0]),
-            ..ClearColorImageInfo::image(img.clone())
-        }).expect("img clear failed")
+        .bind_pipeline_compute(compute_pipeline.clone())
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            compute_pipeline.layout().clone(),
+            0,
+            desc_set,
+        )
+        .dispatch([1024 / 8, 1024 / 8, 1]).expect("compute pass failed")
         .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
             img.clone(),
             img_buf.clone(),
