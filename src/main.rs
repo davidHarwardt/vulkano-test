@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+use image::{ImageBuffer, Rgba};
 use vulkano::{
     VulkanLibrary,
     instance::{
@@ -22,7 +23,7 @@ use vulkano::{
         BufferCreateInfo,
         BufferUsage,
     },
-    command_buffer::{allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo}, AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo}, sync::{self, GpuFuture}, pipeline::{ComputePipeline, Pipeline, PipelineBindPoint}, descriptor_set::{allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet}, image::{StorageImage, ImageDimensions}, format::Format,
+    command_buffer::{allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo}, AutoCommandBufferBuilder, CommandBufferUsage, CopyBufferInfo, ClearColorImageInfo, CopyImageToBufferInfo}, sync::{self, GpuFuture}, pipeline::{ComputePipeline, Pipeline, PipelineBindPoint}, descriptor_set::{allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet}, image::{StorageImage, ImageDimensions}, format::{Format, ClearColorValue},
 };
     
 mod cs {
@@ -134,6 +135,19 @@ fn main() {
         Some(queue.queue_family_index()),
     ).expect("could not create image");
 
+    let img_buf = Buffer::from_iter(
+        &alloc,
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            usage: MemoryUsage::Download,
+            ..Default::default()
+        },
+        (0..(1024 * 1024 * 4)).map(|_| 0u8),
+    ).expect("could not create img_buf");
+
     let mut cmd_buf_builder = AutoCommandBufferBuilder::primary(
         &cmd_buf_alloc,
         queue.queue_family_index(),
@@ -143,15 +157,15 @@ fn main() {
     let wg_count = [1024, 1, 1];
 
     cmd_buf_builder
-        .bind_pipeline_compute(compute_pipeline.clone())
-        .bind_descriptor_sets(
-            PipelineBindPoint::Compute,
-            compute_pipeline.layout().clone(),
-            desc_set_layout_idx as _,
-            desc_set,
-        )
-        .dispatch(wg_count)
-    .expect("cs dispatch failed");
+        .clear_color_image(ClearColorImageInfo {
+            clear_value: ClearColorValue::Float([1.0, 1.0, 1.0, 1.0]),
+            ..ClearColorImageInfo::image(img.clone())
+        }).expect("img clear failed")
+        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(
+            img.clone(),
+            img_buf.clone(),
+        ))
+    .expect("cmd_buf failed to build");
 
     let cmd_buf = cmd_buf_builder
         .build()
@@ -164,10 +178,11 @@ fn main() {
     .expect("failed to flush");
     fut.wait(None).expect("waiting for fut failed");
 
-    let content = data_buf.read().expect("could not read data_buf");
-    for (n, val) in content.iter().enumerate() {
-        assert_eq!(*val, n as u32 * 12);
-    }
+    let buf_contents = img_buf.read().expect("could not read img_buf");
+    let cpu_img = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buf_contents[..])
+        .expect("could not create cpu_img");
+
+    cpu_img.save("img.png").expect("could not save img");
 
     tracing::info!("ok");
 }
