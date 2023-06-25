@@ -14,10 +14,11 @@ stdenv.mkDerivation rec {
         cmake python3
         shaderc shaderc.lib shaderc.dev     # shaders
         shaderc.bin shaderc.static          # |
-
     ];
 
-    LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.shaderc.lib}/lib:${pkgs.shaderc.dev}/lib";
+    
+    LD_LIBRARY_PATH = lib.makeLibraryPath buildInputs;
+    # LD_LIBRARY_PATH = "${pkgs.vulkan-loader}/lib:${pkgs.shaderc.lib}/lib:${pkgs.shaderc.dev}/lib";
     # VULKAN_LIB_DIR = "${pkgs.shaderc.dev}/lib";
     # shellHook = "echo ${pkgs.vulkan-loader}";
 }

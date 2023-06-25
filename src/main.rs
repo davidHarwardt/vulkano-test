@@ -1,5 +1,7 @@
 #![allow(unused)]
 
+use std::sync::Arc;
+
 use image::{ImageBuffer, Rgba};
 use vulkano::{
     VulkanLibrary,
@@ -11,7 +13,7 @@ use vulkano::{
         QueueFlags, 
         Device, 
         DeviceCreateInfo, 
-        QueueCreateInfo,
+        QueueCreateInfo, DeviceExtensions, physical::PhysicalDevice, Queue,
     }, 
     memory::allocator::{
         StandardMemoryAllocator, 
@@ -21,7 +23,7 @@ use vulkano::{
     buffer::{
         Buffer,
         BufferCreateInfo,
-        BufferUsage, BufferContents,
+        BufferUsage, BufferContents, Subbuffer,
     },
     command_buffer::{
         allocator::{
@@ -32,16 +34,16 @@ use vulkano::{
         CommandBufferUsage, 
         CopyBufferInfo, 
         ClearColorImageInfo, 
-        CopyImageToBufferInfo, RenderPassBeginInfo, SubpassContents,
+        CopyImageToBufferInfo, RenderPassBeginInfo, SubpassContents, PrimaryAutoCommandBuffer,
     }, 
     sync::{
         self, 
-        GpuFuture,
+        GpuFuture, FlushError,
     }, 
     pipeline::{
         ComputePipeline, 
         Pipeline, 
-        PipelineBindPoint, graphics::{vertex_input::Vertex, viewport::{Viewport, ViewportState}, input_assembly::InputAssemblyState}, GraphicsPipeline,
+        PipelineBindPoint, graphics::{vertex_input::{Vertex, BuffersDefinition}, viewport::{Viewport, ViewportState}, input_assembly::InputAssemblyState}, GraphicsPipeline,
     }, 
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, 
@@ -50,13 +52,15 @@ use vulkano::{
     }, 
     image::{
         StorageImage, 
-        ImageDimensions, view::ImageView,
+        ImageDimensions, view::ImageView, ImageUsage, SwapchainImage,
     }, 
     format::{
         Format, 
         ClearColorValue,
-    }, render_pass::{Framebuffer, FramebufferCreateInfo, Subpass},
+    }, render_pass::{Framebuffer, FramebufferCreateInfo, Subpass, RenderPass}, swapchain::{Surface, Swapchain, SwapchainCreateInfo, SwapchainCreationError, self, AcquireError, SwapchainPresentInfo, PresentInfo}, shader::ShaderModule,
 };
+use vulkano_win::VkSurfaceBuild;
+use winit::{event_loop::EventLoop, window::{WindowBuilder, Window}};
     
 mod cs {
     vulkano_shaders::shader! {
@@ -127,70 +131,210 @@ struct Vert {
     pos: [f32; 2],
 }
 
+impl Vert {
+    fn triangle_ex() -> [Self; 3] {
+        [
+            Self { pos: [-0.5, -0.5 ] },
+            Self { pos: [ 0.0, -0.5 ] },
+            Self { pos: [ 0.5, -0.25] },
+        ]
+    }
+}
+
+fn select_physical_device(
+    instance: &Arc<Instance>,
+    surface: &Arc<Surface>,
+    dev_exts: &DeviceExtensions,
+) -> (Arc<PhysicalDevice>, u32) {
+    instance.enumerate_physical_devices()
+        .expect("could not enumerate devices")
+        .filter(|p| p.supported_extensions().contains(&dev_exts))
+        .filter_map(|p| {
+            p.queue_family_properties()
+                .iter()
+                .enumerate()
+                .position(|(i, q)| {
+                    q.queue_flags.contains(QueueFlags::GRAPHICS)
+                        && p.surface_support(i as _, &surface).unwrap_or(false)
+                })
+            .map(|q| (p, q as u32))
+        })
+        .min_by_key(|(p, _)| {
+            use vulkano::device::physical::PhysicalDeviceType::*;
+            match p.properties().device_type {
+                DiscreteGpu => 0,
+                IntegratedGpu => 1,
+                VirtualGpu => 2,
+                Cpu => 3,
+                _ => 4,
+            }
+        })
+    .expect("no devices available")
+}
+
+fn get_render_pass(device: Arc<Device>, swapchain: &Arc<Swapchain>) -> Arc<RenderPass> {
+    vulkano::single_pass_renderpass! {
+        device,
+        attachments: {
+            color: {
+                load: Clear,
+                store: Store,
+                format: swapchain.image_format(),
+                samples: 1,
+            },
+        },
+        pass: {
+            color: [color],
+            depth_stencil: {},
+        },
+    }.unwrap()
+}
+
+fn get_framebuffers(
+    images: &[Arc<SwapchainImage>],
+    render_pass: &Arc<RenderPass>,
+) -> Vec<Arc<Framebuffer>> {
+    images.iter()
+        .map(|img| {
+            let view = ImageView::new_default(img.clone()).unwrap();
+            Framebuffer::new(
+                render_pass.clone(),
+                FramebufferCreateInfo {
+                    attachments: vec![view],
+                    ..Default::default()
+                },
+            ).unwrap()
+        })
+    .collect()
+}
+
+fn get_pipeline(
+    device: Arc<Device>,
+    vs: Arc<ShaderModule>,
+    fs: Arc<ShaderModule>,
+    render_pass: Arc<RenderPass>,
+    viewport: Viewport,
+) -> Arc<GraphicsPipeline> {
+    GraphicsPipeline::start()
+        .vertex_input_state(Vert::per_vertex())
+        .vertex_shader(vs.entry_point("main").unwrap(), ())
+        .input_assembly_state(InputAssemblyState::new())
+        .viewport_state(ViewportState::viewport_fixed_scissor_irrelevant([viewport]))
+        .fragment_shader(fs.entry_point("main").unwrap(), ())
+        .render_pass(Subpass::from(render_pass, 0).unwrap())
+        .build(device)
+    .expect("could not create gfx pipeline")
+}
+
+fn get_cmd_buffers(
+    device: &Arc<Device>,
+    queue: &Arc<Queue>,
+    cmd_alloc: &StandardCommandBufferAllocator,
+    pipeline: &Arc<GraphicsPipeline>,
+    framebuffers: &Vec<Arc<Framebuffer>>,
+    vertex_buffer: &Subbuffer<[Vert]>,
+) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
+    framebuffers.iter()
+        .map(|fb| {
+            let mut builder = AutoCommandBufferBuilder::primary(
+                cmd_alloc,
+                queue.queue_family_index(),
+                CommandBufferUsage::MultipleSubmit,
+            ).expect("could not create cmd buffer builder");
+
+            builder
+                .begin_render_pass(RenderPassBeginInfo {
+                    clear_values: vec![Some([0.1, 0.1, 0.1, 1.0].into())],
+                    ..RenderPassBeginInfo::framebuffer(fb.clone())
+                }, SubpassContents::Inline)
+                .expect("could not begin render pass")
+                .bind_pipeline_graphics(pipeline.clone())
+                .bind_vertex_buffers(0, vertex_buffer.clone())
+                .draw(vertex_buffer.len() as _, 1, 0, 0)
+                .expect("could not draw")
+                .end_render_pass()
+            .expect("could not end renderpass");
+
+            Arc::new(builder.build().expect("could not build cmd_buf"))
+        })
+    .collect()
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter("warn,shadertoy=info")
     .init();
 
-    // let event_loop = EventLoop::new();
     let lib = VulkanLibrary::new().expect("could not load vulkan lib");
-    let instance = Instance::new(lib, InstanceCreateInfo::default()).expect("could not create instance");
+    let required_exts = vulkano_win::required_extensions(&lib);
+    let instance = Instance::new(lib, InstanceCreateInfo {
+        enabled_extensions: required_exts,
+        ..Default::default()
+    }).expect("could not create instance");
 
-    let physical_dev = instance.enumerate_physical_devices()
-        .expect("could not enumerate devices")
-        .next()
-    .expect("no devices available");
+    let event_loop = EventLoop::new();
+    let window = Arc::new(WindowBuilder::new()
+        .build(&event_loop)
+    .expect("could not create surface"));
 
-    let queue_family_index = physical_dev
-        .queue_family_properties()
-        .iter()
-        .position(|props| props.queue_flags.contains(QueueFlags::GRAPHICS))
-    .expect("could not find graphics queue") as u32;
+    let surface = vulkano_win::create_surface_from_winit(window.clone(), instance.clone())
+        .expect("could not get surface");
+
+    let dev_exts = DeviceExtensions {
+        khr_swapchain: true,
+        ..DeviceExtensions::empty()
+    };
+
+    let (physical_dev, queue_family_index) = select_physical_device(
+        &instance,
+        &surface,
+        &dev_exts,
+    );
 
     let (dev, mut queues) = Device::new(
-        physical_dev,
+        physical_dev.clone(),
         DeviceCreateInfo {
             queue_create_infos: vec![QueueCreateInfo {
                 queue_family_index,
                 ..Default::default()
             }],
+            enabled_extensions: dev_exts,
             ..Default::default()
         },
     ).expect("failed to create device");
-
     let queue = queues.next().unwrap();
+
+    let caps = physical_dev
+        .surface_capabilities(&surface, Default::default())
+    .expect("could not get surface caps");
+
+    let dims = window.inner_size();
+    let composite_alpha = caps.supported_composite_alpha.into_iter().next().unwrap();
+    let image_format = Some(
+        physical_dev
+            .surface_formats(&surface, Default::default())
+            .unwrap()[0].0,
+    );
+
+    let (mut swapchain, images) = Swapchain::new(
+        dev.clone(),
+        surface.clone(),
+        SwapchainCreateInfo {
+            min_image_count: caps.min_image_count + 1,
+            image_format,
+            image_extent: dims.into(),
+            image_usage: ImageUsage::COLOR_ATTACHMENT,
+            composite_alpha,
+            ..Default::default()
+        },
+    ).expect("could not create swapchain");
+
+    let render_pass = get_render_pass(dev.clone(), &swapchain);
+    let framebuffers = get_framebuffers(&images, &render_pass);
 
     let alloc = StandardMemoryAllocator::new_default(dev.clone());
 
-    let verts = vec![
-        Vert { pos: [-0.5, -0.5] },
-        Vert { pos: [ 0.0,  0.5] },
-        Vert { pos: [ 0.5, -0.25] },
-    ];
-
-    let vs = vs::load(dev.clone()).expect("failed to create vertex shader");
-    let fs = fs::load(dev.clone()).expect("failed to create fragment shader");
-
-    let viewport = Viewport {
-        origin: [0.0, 0.0],
-        dimensions: [1024.0, 1024.0],
-        depth_range: 0.0..1.0,
-    };
-
-    let img_buffer = Buffer::from_iter(
-        &alloc,
-        BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            usage: MemoryUsage::Download,
-            ..Default::default()
-        },
-        (0..(1024 * 1024 * 4)).map(|_| 0u8)
-    ).expect("failed to create img buffer");
-
-    let vert_buffer = Buffer::from_iter(
+    let vert_buf = Buffer::from_iter(
         &alloc,
         BufferCreateInfo {
             usage: BufferUsage::VERTEX_BUFFER,
@@ -200,91 +344,125 @@ fn main() {
             usage: MemoryUsage::Upload,
             ..Default::default()
         },
-        verts,
-    ).expect("could not create vertex buffer");
+        Vert::triangle_ex()
+    ).expect("could not create buffer");
 
-    let pass = vulkano::single_pass_renderpass! {
+    let vs = vs::load(dev.clone()).expect("could not load vertex shader");
+    let fs = fs::load(dev.clone()).expect("could not load fragment shader");
+
+    let mut viewport = Viewport {
+        origin: [0.0, 0.0],
+        dimensions: window.inner_size().into(),
+        depth_range: 0.0..1.0,
+    };
+
+    let pipeline = get_pipeline(
         dev.clone(),
-        attachments: {
-            color: {
-                load: Clear,
-                store: Store,
-                format: Format::R8G8B8A8_UNORM,
-                samples: 1,
-            },
-        },
-        pass: {
-            color: [color],
-            depth_stencil: {},
-        },
-    }.expect("could not create render_pass");
-
-    let pipeline = GraphicsPipeline::start()
-        .vertex_input_state(Vert::per_vertex())
-        .vertex_shader(vs.entry_point("main").unwrap(), ())
-        .fragment_shader(fs.entry_point("main").unwrap(), ())
-        .input_assembly_state(InputAssemblyState::new())
-        .viewport_state(ViewportState::viewport_fixed_scissor_irrelevant([viewport]))
-        .render_pass(Subpass::from(pass.clone(), 0).unwrap())
-    .build(dev.clone()).expect("could not build graphics pipeline");
-
-    let img = StorageImage::new(
-        &alloc,
-        ImageDimensions::Dim2d { width: 1024, height: 1024, array_layers: 1 },
-        Format::R8G8B8A8_UNORM,
-        Some(queue.queue_family_index()),
-    ).expect("could not create img");
-    let view = ImageView::new_default(img.clone()).expect("could not create image view");
-
-    let framebuffer = Framebuffer::new(
-        pass.clone(),
-        FramebufferCreateInfo {
-            attachments: vec![view],
-            ..Default::default()
-        },
-    ).expect("could not create framebuffer");
-
-    let cmd_buf_alloc = StandardCommandBufferAllocator::new(
-        dev.clone(),
-        StandardCommandBufferAllocatorCreateInfo::default()
+        vs.clone(),
+        fs.clone(),
+        render_pass.clone(),
+        viewport.clone(),
     );
-    let mut cmd_builder = AutoCommandBufferBuilder::primary(
-        &cmd_buf_alloc,
-        queue.queue_family_index(),
-        CommandBufferUsage::OneTimeSubmit,
-    ).expect("could not create cmd_builder");
 
-    cmd_builder
-        .begin_render_pass(RenderPassBeginInfo {
-            clear_values: vec![Some([0.0, 0.0, 1.0, 1.0].into())],
-            ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
-        }, SubpassContents::Inline)
-        .expect("could not begin renderpass")
-        .bind_pipeline_graphics(pipeline.clone())
-        .bind_vertex_buffers(0, vert_buffer.clone())
-        .draw(3, 1, 0, 0)
-        .expect("could not draw")
-        .end_render_pass()
-        .expect("could not end renderpass")
-        .copy_image_to_buffer(CopyImageToBufferInfo::image_buffer(img, img_buffer.clone()))
-    .expect("could not copy framebuffer to img_buffer");
+    let cmd_alloc = StandardCommandBufferAllocator::new(dev.clone(), Default::default());
 
-    let cmd_buf = cmd_builder.build().expect("could not build command buffer");
-    let fut = sync::now(dev.clone())
-        .then_execute(queue.clone(), cmd_buf)
-        .expect("could not execute cmd_buf")
-        .then_signal_fence_and_flush()
-    .expect("could not flush");
-    fut.wait(None).unwrap();
+    let mut cmd_buf = get_cmd_buffers(
+        &dev,
+        &queue,
+        &cmd_alloc,
+        &pipeline,
+        &framebuffers,
+        &vert_buf,
+    );
 
-    let buf_img = img_buffer.read().expect("could not read image buffer");
-    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(1024, 1024, &buf_img[..])
-        .expect("could not create img from data");
-
-    img.save("img.png").expect("could not save img");
+    let mut window_resized = false;
+    let mut recreate_swapchain = false;
 
     tracing::info!("ok");
+    event_loop.run(move |event, _, ctrl| {
+        use winit::event::{Event, WindowEvent};
+        match event {
+            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
+                ctrl.set_exit();
+            },
+            Event::WindowEvent { event: WindowEvent::Resized(_), .. } => {
+                window_resized = true;
+            },
+            Event::MainEventsCleared => {},
+            Event::RedrawRequested(_) => {
+                let (image_i, suboptimal, acquire_fut) = match swapchain::acquire_next_image(swapchain.clone(), None) {
+                    Ok(r) => r,
+                    Err(AcquireError::OutOfDate) => {
+                        recreate_swapchain = true;
+                        return;
+                    },
+                    Err(e) => panic!("failed to acquire next image"),
+                };
+
+                if suboptimal { recreate_swapchain = true }
+                let execution = sync::now(dev.clone())
+                    .join(acquire_fut)
+                    .then_execute(queue.clone(), cmd_buf[image_i as usize].clone())
+                    .expect("could not execute")
+                    .then_swapchain_present(
+                        queue.clone(),
+                        SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_i),
+                    )
+                .then_signal_fence_and_flush();
+
+                match execution {
+                    Ok(fut) => fut.wait(None).unwrap(),
+                    Err(FlushError::OutOfDate) => recreate_swapchain = true,
+                    Err(e) => tracing::warn!("failed to flush future: {e}"),
+                }
+            },
+            Event::RedrawEventsCleared => {
+                if window_resized || recreate_swapchain {
+                    recreate_swapchain = false;
+                    let new_dim = window.inner_size();
+
+                    let (new_swapchain, new_images) = match swapchain.recreate(SwapchainCreateInfo {
+                        image_extent: new_dim.into(),
+                        ..swapchain.create_info()
+                    }) {
+                        Ok(r) => r,
+                        Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
+                        Err(e) => panic!("failed to recreate swapchain"),
+                    };
+                    swapchain = new_swapchain;
+                    let new_framebuffers = get_framebuffers(&new_images, &render_pass);
+
+                    if window_resized {
+                        window_resized = false;
+
+                        viewport.dimensions = new_dim.into();
+                        let new_pipeline = get_pipeline(
+                            dev.clone(),
+                            vs.clone(),
+                            fs.clone(),
+                            render_pass.clone(),
+                            viewport.clone(),
+                        );
+
+                        cmd_buf = get_cmd_buffers(
+                            &dev,
+                            &queue,
+                            &cmd_alloc,
+                            &new_pipeline,
+                            &new_framebuffers,
+                            &vert_buf,
+                        );
+                    }
+                }
+            },
+            _ => (),
+        }
+    });
+
+    tracing::info!("exiting");
 }
+
+
 
 
 
